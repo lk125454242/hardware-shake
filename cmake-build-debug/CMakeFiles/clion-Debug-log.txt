@@ -1,0 +1,20 @@
+D:\JetBrains\CLion\bin\cmake\win\x64\bin\cmake.exe -DCMAKE_BUILD_TYPE=Debug -DCMAKE_MAKE_PROGRAM=D:/JetBrains/CLion/bin/ninja/win/x64/ninja.exe -G Ninja -S J:\ESP32\shake -B J:\ESP32\shake\cmake-build-debug
+CMake Error at CMakeLists.txt:5 (include):
+  include could not find requested file:
+
+    /tools/cmake/project.cmake
+
+
+-- The C compiler identification is GNU 13.1.0
+-- The CXX compiler identification is GNU 13.1.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: D:/JetBrains/CLion/bin/mingw/bin/gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: D:/JetBrains/CLion/bin/mingw/bin/g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Configuring incomplete, errors occurred!
