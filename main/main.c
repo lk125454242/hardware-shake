@@ -18,13 +18,21 @@
 
 static const char *TAG = "main";
 
-/* TMC2209 步进电机：速度与倒计时，转速 1~300 RPM（步/秒依 MOTOR_STEPS_PER_REV 换算） */
-#define MOTOR_SPEED_MIN      4    /* 最小步/秒 ≈ 1 RPM @200步/圈 */
-#define MOTOR_SPEED_MAX      1000 /* 最大步/秒 = 300 RPM @200步/圈 */
+/* TMC2209 + 1.8° 步进电机：细分引脚(MS1/MS2等)全低 = 全步，每圈 200 个 STEP 脉冲 */
+#define MOTOR_STEPS_PER_REV  CONFIG_MOTOR_STEPS_PER_REV
+/* 转速 1~300 RPM：步/秒 = RPM * MOTOR_STEPS_PER_REV / 60 */
+#define MOTOR_SPEED_MIN      4    /* 最小脉冲/秒 ≈ 1 RPM（200步/圈） */
+#define MOTOR_SPEED_MAX      1000 /* 最大脉冲/秒 = 300 RPM */
 #define MOTOR_SPEED_DEFAULT  100
 #define COUNTDOWN_DEFAULT_SEC 300 /* 默认 5 分钟 */
 #define BUTTON_DEBOUNCE_MS   80
 #define DISPLAY_REFRESH_MS   200
+
+/* RPM = 脉冲频率(Hz) * 60 / 每圈脉冲数，四舍五入 */
+static inline int steps_per_sec_to_rpm(int steps_per_sec)
+{
+    return (steps_per_sec * 60 + MOTOR_STEPS_PER_REV / 2) / MOTOR_STEPS_PER_REV;
+}
 
 #define I2C_MASTER_NUM         I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ     400000
@@ -413,7 +421,7 @@ static void display_task(void *arg)
     char line1[24], line2[24], line3[24];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_REFRESH_MS));
-        int rpm = s_speed_steps_per_sec * 60 / CONFIG_MOTOR_STEPS_PER_REV;
+        int rpm = steps_per_sec_to_rpm(s_speed_steps_per_sec);
         int c = s_countdown_sec;
         int m = c / 60, s = c % 60;
         snprintf(line1, sizeof(line1), "RPM: %d", rpm);
@@ -463,7 +471,7 @@ void app_main(void)
     char line0[24];
     snprintf(line0, sizeof(line0), "IP: %s", s_ip_str);
     oled_draw_string_line(0, line0);
-    int rpm0 = s_speed_steps_per_sec * 60 / CONFIG_MOTOR_STEPS_PER_REV;
+    int rpm0 = steps_per_sec_to_rpm(s_speed_steps_per_sec);
     int c0 = s_countdown_sec;
     snprintf(line0, sizeof(line0), "RPM: %d", rpm0);
     oled_draw_string_line(1, line0);

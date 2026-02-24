@@ -74,8 +74,9 @@ config BTN_MOTOR_STOP_GPIO
         轻触开关，电机停止。勿与其它引脚重复。
 
 config MOTOR_STEPS_PER_REV
-    int "步进电机每圈步数"
-    default 200
+    int "电机每圈脉冲数（与驱动细分一致）"
+    default 1600
     help
-        1.8° 电机一般为 200 步/圈（整步）。
+        1.8° 步进电机 + TMC2209 细分引脚(MS1/MS2等)全低 = 全步，
+        每圈 200 个 STEP 脉冲。若接不同细分请按实际改（如 1/8 细分为 1600）。
 endmenu
