@@ -1,18 +1,6 @@
 # put here your custom config value
 # 注意：各 GPIO 不可重复。当前默认占用：OLED 8,9 | 电机 2,3,4 | 按钮 5,6,7,10
 menu "Example Configuration"
-config ESP_WIFI_SSID
-    string "WiFi SSID"
-    default "DESKTOP-F5CB7OD"
-    help
-	SSID (network name) for the example to connect to.
-
-config ESP_WIFI_PASSWORD
-    string "WiFi Password"
-    default "629/dP27"
-    help
-	WiFi password (WPA or WPA2) for the example to use.
-
 config OLED_I2C_SDA_GPIO
     int "OLED I2C SDA GPIO"
     default 8

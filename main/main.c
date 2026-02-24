@@ -2,13 +2,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_netif_types.h"
-#include "nvs_flash.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -20,10 +14,11 @@ static const char *TAG = "main";
 
 /* TMC2209 + 1.8° 步进电机：细分引脚(MS1/MS2等)全低 = 全步，每圈 200 个 STEP 脉冲 */
 #define MOTOR_STEPS_PER_REV  CONFIG_MOTOR_STEPS_PER_REV
-/* 转速 1~300 RPM：步/秒 = RPM * MOTOR_STEPS_PER_REV / 60 */
-#define MOTOR_SPEED_MIN      4    /* 最小脉冲/秒 ≈ 1 RPM（200步/圈） */
-#define MOTOR_SPEED_MAX      1000 /* 最大脉冲/秒 = 300 RPM */
-#define MOTOR_SPEED_DEFAULT  100
+/* 转速 150~5000 RPM：步/秒 = RPM * MOTOR_STEPS_PER_REV / 60 */
+#define MOTOR_SPEED_MIN      500   /* 最小脉冲/秒 = 150 RPM（200步/圈） */
+#define MOTOR_SPEED_MAX      16667 /* 最大脉冲/秒 = 5000 RPM */
+#define MOTOR_SPEED_DEFAULT  500
+#define MOTOR_SPEED_STEP     8     /* 每次加减速步进数（脉冲/秒） */
 #define COUNTDOWN_DEFAULT_SEC 300 /* 默认 5 分钟 */
 #define BUTTON_DEBOUNCE_MS   80
 #define DISPLAY_REFRESH_MS   200
@@ -43,19 +38,12 @@ static inline int steps_per_sec_to_rpm(int steps_per_sec)
 #define OLED_HEIGHT  64
 #define OLED_PAGES   (OLED_HEIGHT / 8)
 
-#define WIFI_CONNECTED_BIT BIT0
-static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
-#define WIFI_MAX_RETRY 5
-static esp_ip4_addr_t s_ip_addr;
-
 /* 电机与倒计时状态（多任务共享，仅简单读写） */
 static volatile int s_motor_running = 0;
 static volatile int s_speed_steps_per_sec = MOTOR_SPEED_DEFAULT;
 static volatile int s_countdown_sec = COUNTDOWN_DEFAULT_SEC;
-static char s_ip_str[20] = "0.0.0.0";
 
-/* 6x8 字体，仅包含 0-9 . : 空格 I P，用于 "IP: x.x.x.x" */
+/* 6x8 字体，0-9、A-S、常用符号 */
 static const uint8_t font_6x8[][6] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }, /* space 0x20 */
     { 0x00, 0x00, 0x5F, 0x00, 0x00, 0x00 }, /* ! */
@@ -109,11 +97,15 @@ static const uint8_t font_6x8[][6] = {
     { 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00 }, /* Q 0x51 */
     { 0x7F, 0x09, 0x19, 0x29, 0x46, 0x00 }, /* R 0x52 */
     { 0x46, 0x49, 0x49, 0x49, 0x31, 0x00 }, /* S 0x53 */
+    { 0x01, 0x01, 0x7F, 0x01, 0x01, 0x00 }, /* T 0x54 */
+    { 0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00 }, /* U 0x55 */
 };
 
 #define FONT_FIRST 0x20
-#define FONT_LAST  0x53
+#define FONT_LAST  0x55
 #define FONT_COLS  6
+#define FONT_DOUBLE_W   12   /* 放大一倍后每字宽 12 像素 */
+#define FONT_DOUBLE_H   16   /* 放大一倍后每字高 16 像素 = 2 页 */
 
 static esp_err_t oled_write_cmd(uint8_t cmd)
 {
@@ -230,50 +222,43 @@ static esp_err_t oled_draw_string_line(uint8_t page, const char *str)
     return oled_write_data(buf, sizeof(buf));
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+/* 将 6x8 字形的一列 8 位纵向加倍为 2 字节（页0、页1） */
+static void glyph_col_to_double_page(uint8_t glyph_byte, uint8_t *p0, uint8_t *p1)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < WIFI_MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "重连 WiFi，第 %d 次", s_retry_num);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT); /* 避免死等 */
-        }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        s_ip_addr = event->ip_info.ip;
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
+    uint8_t b0 = (glyph_byte >> 0) & 1, b1 = (glyph_byte >> 1) & 1, b2 = (glyph_byte >> 2) & 1, b3 = (glyph_byte >> 3) & 1;
+    uint8_t b4 = (glyph_byte >> 4) & 1, b5 = (glyph_byte >> 5) & 1, b6 = (glyph_byte >> 6) & 1, b7 = (glyph_byte >> 7) & 1;
+    *p0 = (b0 ? 0xC0 : 0) | (b1 ? 0x30 : 0) | (b2 ? 0x0C : 0) | (b3 ? 0x03 : 0);
+    *p1 = (b4 ? 0xC0 : 0) | (b5 ? 0x30 : 0) | (b6 ? 0x0C : 0) | (b7 ? 0x03 : 0);
 }
 
-static void wifi_init_sta(void)
+/* 放大一倍绘制一行字符串到指定“行”（每行占 2 页，16 像素高），每字 12 像素宽 */
+static esp_err_t oled_draw_string_line_double(uint8_t line_0_to_3, const char *str)
 {
-    s_wifi_event_group = xEventGroupCreate();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_event_handler_instance_t any_id, got_ip;
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &any_id);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &got_ip);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .threshold.authmode = WIFI_AUTH_WPA_PSK,
-        },
-    };
-    strncpy((char *)wifi_config.sta.ssid, CONFIG_ESP_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *)wifi_config.sta.password, CONFIG_ESP_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
-
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-    ESP_LOGI(TAG, "WiFi 启动，SSID: %s", CONFIG_ESP_WIFI_SSID);
+    uint8_t page_start = (uint8_t)(line_0_to_3 * 2);
+    uint8_t buf[OLED_WIDTH * 2];  /* 12 列 * 2 页，按列优先写满一行再写下一页 */
+    memset(buf, 0, sizeof(buf));
+    const int max_chars = OLED_WIDTH / FONT_DOUBLE_W;
+    int char_count = 0;
+    for (const char *p = str; *p && char_count < max_chars; p++, char_count++) {
+        unsigned char c = (unsigned char)*p;
+        for (int col = 0; col < FONT_COLS; col++) {
+            uint8_t g = oled_get_glyph(c, col);
+            uint8_t p0, p1;
+            glyph_col_to_double_page(g, &p0, &p1);
+            int dc = char_count * FONT_DOUBLE_W + col * 2;
+            buf[dc] = p0;
+            buf[dc + 1] = p0;
+            buf[OLED_WIDTH + dc] = p1;
+            buf[OLED_WIDTH + dc + 1] = p1;
+        }
+    }
+    oled_write_cmd(0x21);
+    oled_write_cmd(0);
+    oled_write_cmd(OLED_WIDTH - 1);
+    oled_write_cmd(0x22);
+    oled_write_cmd(page_start);
+    oled_write_cmd(page_start + 1);
+    return oled_write_data(buf, sizeof(buf));
 }
 
 /* 检查所有外设/按钮配置的 GPIO 是否重复，若有则打日志并中止 */
@@ -344,7 +329,7 @@ static void stepper_task(void *arg)
         if (speed < MOTOR_SPEED_MIN) speed = MOTOR_SPEED_MIN;
         /* 每步 = 高 + 低，半周期 500000/speed 微秒 */
         uint32_t half_us = 500000 / (uint32_t)speed;
-        if (half_us < 100) half_us = 100;
+        if (half_us < 25) half_us = 25;  /* 支持约 5000 RPM */
 
         gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 1);
         if (half_us >= 1000) {
@@ -389,14 +374,14 @@ static void button_task(void *arg)
             if (t - last_up > BUTTON_DEBOUNCE_MS) {
                 last_up = t;
                 if (s_speed_steps_per_sec < MOTOR_SPEED_MAX)
-                    s_speed_steps_per_sec += 10;
+                    s_speed_steps_per_sec += MOTOR_SPEED_STEP;
             }
         }
         if (button_pressed(CONFIG_BTN_SPEED_DOWN_GPIO)) {
             if (t - last_down > BUTTON_DEBOUNCE_MS) {
                 last_down = t;
                 if (s_speed_steps_per_sec > MOTOR_SPEED_MIN)
-                    s_speed_steps_per_sec -= 10;
+                    s_speed_steps_per_sec -= MOTOR_SPEED_STEP;
             }
         }
         if (button_pressed(CONFIG_BTN_MOTOR_START_GPIO)) {
@@ -424,38 +409,17 @@ static void display_task(void *arg)
         int rpm = steps_per_sec_to_rpm(s_speed_steps_per_sec);
         int c = s_countdown_sec;
         int m = c / 60, s = c % 60;
-        snprintf(line1, sizeof(line1), "RPM: %d", rpm);
-        snprintf(line2, sizeof(line2), "%02d:%02d", m, s);
-        snprintf(line3, sizeof(line3), "%s", s_motor_running ? "RUN " : "STOP");
-        oled_draw_string_line(1, line1);
-        oled_draw_string_line(2, line2);
-        oled_draw_string_line(3, line3);
+        snprintf(line1, sizeof(line1), "SPEED %d", rpm);
+        snprintf(line2, sizeof(line2), "TIME %02d:%02d", m, s);
+        snprintf(line3, sizeof(line3), "%s", s_motor_running ? "RUN" : "STOP");
+        oled_draw_string_line_double(1, line1);
+        oled_draw_string_line_double(2, line2);
+        oled_draw_string_line_double(3, line3);
     }
 }
 
 void app_main(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    wifi_init_sta();
-
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, false, portMAX_DELAY);
-
-    uint32_t ip = s_ip_addr.addr;
-    snprintf(s_ip_str, sizeof(s_ip_str), "%d.%d.%d.%d",
-             (int)(ip >> 0) & 0xff,
-             (int)(ip >> 8) & 0xff,
-             (int)(ip >> 16) & 0xff,
-             (int)(ip >> 24) & 0xff);
-    ESP_LOGI(TAG, "已连接 WiFi，IP: %s", s_ip_str);
-
     esp_err_t err = oled_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OLED 初始化失败: %s", esp_err_to_name(err));
@@ -465,19 +429,18 @@ void app_main(void)
     check_gpio_duplicates();
     tmc2209_gpio_init();
 
-    /* OLED 四行：第一行 WiFi IP，第二行转速，第三行倒计时，第四行 RUN/STOP */
+    /* OLED 四行（放大一倍）：READY / SPEED / TIME / RUN|STOP */
     for (uint8_t p = 0; p < OLED_PAGES; p++)
         oled_clear_page(p);
+    oled_draw_string_line_double(0, "READY");
     char line0[24];
-    snprintf(line0, sizeof(line0), "IP: %s", s_ip_str);
-    oled_draw_string_line(0, line0);
     int rpm0 = steps_per_sec_to_rpm(s_speed_steps_per_sec);
     int c0 = s_countdown_sec;
-    snprintf(line0, sizeof(line0), "RPM: %d", rpm0);
-    oled_draw_string_line(1, line0);
-    snprintf(line0, sizeof(line0), "%02d:%02d", c0 / 60, c0 % 60);
-    oled_draw_string_line(2, line0);
-    oled_draw_string_line(3, "STOP");
+    snprintf(line0, sizeof(line0), "SPEED %d", rpm0);
+    oled_draw_string_line_double(1, line0);
+    snprintf(line0, sizeof(line0), "TIME %02d:%02d", c0 / 60, c0 % 60);
+    oled_draw_string_line_double(2, line0);
+    oled_draw_string_line_double(3, "STOP");
 
     xTaskCreate(stepper_task, "stepper", 2048, NULL, 5, NULL);
     xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
