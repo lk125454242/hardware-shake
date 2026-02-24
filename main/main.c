@@ -14,14 +14,14 @@ static const char *TAG = "main";
 
 /* TMC2209 + 1.8° 步进电机：细分引脚(MS1/MS2等)全低 = 全步，每圈 200 个 STEP 脉冲 */
 #define MOTOR_STEPS_PER_REV  CONFIG_MOTOR_STEPS_PER_REV
-/* 转速 150~5000 RPM：步/秒 = RPM * MOTOR_STEPS_PER_REV / 60 */
-#define MOTOR_SPEED_MIN      500   /* 最小脉冲/秒 = 150 RPM（200步/圈） */
-#define MOTOR_SPEED_MAX      16667 /* 最大脉冲/秒 = 5000 RPM */
-#define MOTOR_SPEED_DEFAULT  500
+/* 转速 150~2000 RPM：步/秒 = RPM * MOTOR_STEPS_PER_REV / 60 */
+#define MOTOR_SPEED_MIN      600   /* 最小脉冲/秒 = 150 RPM（200步/圈） */
+#define MOTOR_SPEED_MAX      6667  /* 最大脉冲/秒 = 2000 RPM */
+#define MOTOR_SPEED_DEFAULT  1000
 #define MOTOR_SPEED_STEP     8     /* 每次加减速步进数（脉冲/秒） */
 #define COUNTDOWN_DEFAULT_SEC 300 /* 默认 5 分钟 */
 #define BUTTON_DEBOUNCE_MS   80
-#define DISPLAY_REFRESH_MS   200
+#define DISPLAY_REFRESH_MS   100   /* 刷新间隔，保证倒计时能及时显示 */
 
 /* RPM = 脉冲频率(Hz) * 60 / 每圈脉冲数，四舍五入 */
 static inline int steps_per_sec_to_rpm(int steps_per_sec)
@@ -104,8 +104,6 @@ static const uint8_t font_6x8[][6] = {
 #define FONT_FIRST 0x20
 #define FONT_LAST  0x55
 #define FONT_COLS  6
-#define FONT_DOUBLE_W   12   /* 放大一倍后每字宽 12 像素 */
-#define FONT_DOUBLE_H   16   /* 放大一倍后每字高 16 像素 = 2 页 */
 
 static esp_err_t oled_write_cmd(uint8_t cmd)
 {
@@ -222,45 +220,6 @@ static esp_err_t oled_draw_string_line(uint8_t page, const char *str)
     return oled_write_data(buf, sizeof(buf));
 }
 
-/* 将 6x8 字形的一列 8 位纵向加倍为 2 字节（页0、页1） */
-static void glyph_col_to_double_page(uint8_t glyph_byte, uint8_t *p0, uint8_t *p1)
-{
-    uint8_t b0 = (glyph_byte >> 0) & 1, b1 = (glyph_byte >> 1) & 1, b2 = (glyph_byte >> 2) & 1, b3 = (glyph_byte >> 3) & 1;
-    uint8_t b4 = (glyph_byte >> 4) & 1, b5 = (glyph_byte >> 5) & 1, b6 = (glyph_byte >> 6) & 1, b7 = (glyph_byte >> 7) & 1;
-    *p0 = (b0 ? 0xC0 : 0) | (b1 ? 0x30 : 0) | (b2 ? 0x0C : 0) | (b3 ? 0x03 : 0);
-    *p1 = (b4 ? 0xC0 : 0) | (b5 ? 0x30 : 0) | (b6 ? 0x0C : 0) | (b7 ? 0x03 : 0);
-}
-
-/* 放大一倍绘制一行字符串到指定“行”（每行占 2 页，16 像素高），每字 12 像素宽 */
-static esp_err_t oled_draw_string_line_double(uint8_t line_0_to_3, const char *str)
-{
-    uint8_t page_start = (uint8_t)(line_0_to_3 * 2);
-    uint8_t buf[OLED_WIDTH * 2];  /* 12 列 * 2 页，按列优先写满一行再写下一页 */
-    memset(buf, 0, sizeof(buf));
-    const int max_chars = OLED_WIDTH / FONT_DOUBLE_W;
-    int char_count = 0;
-    for (const char *p = str; *p && char_count < max_chars; p++, char_count++) {
-        unsigned char c = (unsigned char)*p;
-        for (int col = 0; col < FONT_COLS; col++) {
-            uint8_t g = oled_get_glyph(c, col);
-            uint8_t p0, p1;
-            glyph_col_to_double_page(g, &p0, &p1);
-            int dc = char_count * FONT_DOUBLE_W + col * 2;
-            buf[dc] = p0;
-            buf[dc + 1] = p0;
-            buf[OLED_WIDTH + dc] = p1;
-            buf[OLED_WIDTH + dc + 1] = p1;
-        }
-    }
-    oled_write_cmd(0x21);
-    oled_write_cmd(0);
-    oled_write_cmd(OLED_WIDTH - 1);
-    oled_write_cmd(0x22);
-    oled_write_cmd(page_start);
-    oled_write_cmd(page_start + 1);
-    return oled_write_data(buf, sizeof(buf));
-}
-
 /* 检查所有外设/按钮配置的 GPIO 是否重复，若有则打日志并中止 */
 static void check_gpio_duplicates(void)
 {
@@ -320,16 +279,23 @@ static void tmc2209_gpio_init(void)
 static void stepper_task(void *arg)
 {
     int64_t last_sec_us = esp_timer_get_time();
+    static int was_running = 0;
     for (;;) {
         if (!s_motor_running) {
+            was_running = 0;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
+        }
+        /* 电机刚启动时重置 1 秒计时，使倒计时从“启动后 1 秒”开始减 */
+        if (!was_running) {
+            was_running = 1;
+            last_sec_us = esp_timer_get_time();
         }
         int speed = s_speed_steps_per_sec;
         if (speed < MOTOR_SPEED_MIN) speed = MOTOR_SPEED_MIN;
         /* 每步 = 高 + 低，半周期 500000/speed 微秒 */
         uint32_t half_us = 500000 / (uint32_t)speed;
-        if (half_us < 25) half_us = 25;  /* 支持约 5000 RPM */
+        if (half_us < 50) half_us = 50;  /* 支持约 2000 RPM */
 
         gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 1);
         if (half_us >= 1000) {
@@ -355,6 +321,7 @@ static void stepper_task(void *arg)
                 s_motor_running = 0;
             }
         }
+        vTaskDelay(0);  /* 让出 CPU，便于 display_task 刷新 OLED 倒计时 */
     }
 }
 
@@ -388,8 +355,7 @@ static void button_task(void *arg)
             if (t - last_start > BUTTON_DEBOUNCE_MS) {
                 last_start = t;
                 s_motor_running = 1;
-                if (s_countdown_sec <= 0)
-                    s_countdown_sec = COUNTDOWN_DEFAULT_SEC;
+                s_countdown_sec = COUNTDOWN_DEFAULT_SEC;  /* 每次点击开始都重启定时器 */
             }
         }
         if (button_pressed(CONFIG_BTN_MOTOR_STOP_GPIO)) {
@@ -403,18 +369,18 @@ static void button_task(void *arg)
 
 static void display_task(void *arg)
 {
-    char line1[24], line2[24], line3[24];
+    char line0[24], line1[24], line2[24];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_REFRESH_MS));
         int rpm = steps_per_sec_to_rpm(s_speed_steps_per_sec);
         int c = s_countdown_sec;
         int m = c / 60, s = c % 60;
+        snprintf(line0, sizeof(line0), "STATE %s", s_motor_running ? "RUN" : "STOP");
         snprintf(line1, sizeof(line1), "SPEED %d", rpm);
         snprintf(line2, sizeof(line2), "TIME %02d:%02d", m, s);
-        snprintf(line3, sizeof(line3), "%s", s_motor_running ? "RUN" : "STOP");
-        oled_draw_string_line_double(1, line1);
-        oled_draw_string_line_double(2, line2);
-        oled_draw_string_line_double(3, line3);
+        oled_draw_string_line(0, line0);
+        oled_draw_string_line(1, line1);
+        oled_draw_string_line(2, line2);
     }
 }
 
@@ -429,21 +395,20 @@ void app_main(void)
     check_gpio_duplicates();
     tmc2209_gpio_init();
 
-    /* OLED 四行（放大一倍）：READY / SPEED / TIME / RUN|STOP */
+    /* OLED 三行：第 0 页 STATE RUN/STOP，第 1 页 SPEED，第 2 页 TIME（定时器减少时同步刷新） */
     for (uint8_t p = 0; p < OLED_PAGES; p++)
         oled_clear_page(p);
-    oled_draw_string_line_double(0, "READY");
     char line0[24];
     int rpm0 = steps_per_sec_to_rpm(s_speed_steps_per_sec);
     int c0 = s_countdown_sec;
+    oled_draw_string_line(0, "STATE STOP");
     snprintf(line0, sizeof(line0), "SPEED %d", rpm0);
-    oled_draw_string_line_double(1, line0);
+    oled_draw_string_line(1, line0);
     snprintf(line0, sizeof(line0), "TIME %02d:%02d", c0 / 60, c0 % 60);
-    oled_draw_string_line_double(2, line0);
-    oled_draw_string_line_double(3, "STOP");
+    oled_draw_string_line(2, line0);
 
     xTaskCreate(stepper_task, "stepper", 2048, NULL, 5, NULL);
     xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
-    xTaskCreate(display_task, "display", 2048, NULL, 4, NULL);
-    ESP_LOGI(TAG, "OLED 四行已显示，电机与按钮任务已启动");
+    xTaskCreate(display_task, "display", 2048, NULL, 6, NULL);  /* 与按钮同优先级，高于步进，保证倒计时能刷新到 OLED */
+    ESP_LOGI(TAG, "OLED 已显示 STATE/SPEED/TIME，电机与按钮任务已启动");
 }
