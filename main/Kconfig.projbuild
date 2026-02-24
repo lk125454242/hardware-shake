@@ -49,7 +49,10 @@ config TMC2209_ENABLE_GPIO
     help
         使能引脚，低电平使能。勿与其它引脚重复。
 
-confi2222222222222
+config BTN_SPEED_UP_GPIO
+    int "按钮1 增加转速 GPIO"
+    default 5
+    help
         轻触开关，增加电机转速。勿与其它引脚重复。
 
 config BTN_SPEED_DOWN_GPIO
@@ -72,7 +75,7 @@ config BTN_MOTOR_STOP_GPIO
 
 config MOTOR_STEPS_PER_REV
     int "步进电机每圈步数"
-    default 200
+    default 1600
     help
         1.8° 电机一般为 200 步/圈（整步）。
 endmenu
