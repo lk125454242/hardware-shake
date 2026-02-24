@@ -2,13 +2,31 @@
 menu "Example Configuration"
 config ESP_WIFI_SSID
     string "WiFi SSID"
-    default "myssid"
+    default "DESKTOP-F5CB7OD"
     help
 	SSID (network name) for the example to connect to.
 
 config ESP_WIFI_PASSWORD
     string "WiFi Password"
-    default "mypassword"
+    default "629/dP27"
     help
 	WiFi password (WPA or WPA2) for the example to use.
+
+config OLED_I2C_SDA_GPIO
+    int "OLED I2C SDA GPIO"
+    default 8
+    help
+        GPIO for I2C SDA (SSD1306).
+
+config OLED_I2C_SCL_GPIO
+    int "OLED I2C SCL GPIO"
+    default 9
+    help
+        GPIO for I2C SCL (SSD1306).
+
+config OLED_I2C_ADDR
+    hex "OLED I2C 地址"
+    default 0x3C
+    help
+        SSD1306 I2C 从机地址，常见 0x3C 或 0x3D。
 endmenu
