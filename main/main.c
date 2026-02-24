@@ -10,11 +10,21 @@
 #include "esp_netif_types.h"
 #include "nvs_flash.h"
 #include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 
 static const char *TAG = "main";
+
+/* TMC2209 步进电机：速度与倒计时 */
+#define MOTOR_SPEED_MIN      20   /* 最小步/秒 */
+#define MOTOR_SPEED_MAX      500  /* 最大步/秒 */
+#define MOTOR_SPEED_DEFAULT  100
+#define COUNTDOWN_DEFAULT_SEC 300 /* 默认 5 分钟 */
+#define BUTTON_DEBOUNCE_MS   80
+#define DISPLAY_REFRESH_MS   200
 
 #define I2C_MASTER_NUM         I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ     400000
@@ -30,6 +40,12 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 #define WIFI_MAX_RETRY 5
 static esp_ip4_addr_t s_ip_addr;
+
+/* 电机与倒计时状态（多任务共享，仅简单读写） */
+static volatile int s_motor_running = 0;
+static volatile int s_speed_steps_per_sec = MOTOR_SPEED_DEFAULT;
+static volatile int s_countdown_sec = COUNTDOWN_DEFAULT_SEC;
+static char s_ip_str[20] = "0.0.0.0";
 
 /* 6x8 字体，仅包含 0-9 . : 空格 I P，用于 "IP: x.x.x.x" */
 static const uint8_t font_6x8[][6] = {
@@ -82,10 +98,13 @@ static const uint8_t font_6x8[][6] = {
     { 0x7F, 0x04, 0x08, 0x10, 0x7F, 0x00 }, /* N */
     { 0x3E, 0x41, 0x41, 0x41, 0x3E, 0x00 }, /* O */
     { 0x7F, 0x09, 0x09, 0x09, 0x06, 0x00 }, /* P 0x50 */
+    { 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x00 }, /* Q 0x51 */
+    { 0x7F, 0x09, 0x19, 0x29, 0x46, 0x00 }, /* R 0x52 */
+    { 0x46, 0x49, 0x49, 0x49, 0x31, 0x00 }, /* S 0x53 */
 };
 
 #define FONT_FIRST 0x20
-#define FONT_LAST  0x50
+#define FONT_LAST  0x53
 #define FONT_COLS  6
 
 static esp_err_t oled_write_cmd(uint8_t cmd)
@@ -187,10 +206,10 @@ static uint8_t oled_get_glyph(unsigned char c, int col)
     return font_6x8[c - FONT_FIRST][col];
 }
 
-static esp_err_t oled_draw_string_line0(const char *str)
+static esp_err_t oled_draw_string_line(uint8_t page, const char *str)
 {
     oled_write_cmd(0x21); oled_write_cmd(0); oled_write_cmd(OLED_WIDTH - 1);
-    oled_write_cmd(0x22); oled_write_cmd(0); oled_write_cmd(0);
+    oled_write_cmd(0x22); oled_write_cmd(page); oled_write_cmd(page);
 
     uint8_t buf[OLED_WIDTH];
     memset(buf, 0, sizeof(buf));
@@ -249,6 +268,153 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "WiFi 启动，SSID: %s", CONFIG_ESP_WIFI_SSID);
 }
 
+/* 检查所有外设/按钮配置的 GPIO 是否重复，若有则打日志并中止 */
+static void check_gpio_duplicates(void)
+{
+    struct { int gpio; const char *name; } pins[] = {
+        { CONFIG_OLED_I2C_SDA_GPIO,    "OLED SDA" },
+        { CONFIG_OLED_I2C_SCL_GPIO,    "OLED SCL" },
+        { CONFIG_TMC2209_STEP_GPIO,    "TMC2209 STEP" },
+        { CONFIG_TMC2209_DIR_GPIO,     "TMC2209 DIR" },
+        { CONFIG_TMC2209_ENABLE_GPIO, "TMC2209 ENABLE" },
+        { CONFIG_BTN_SPEED_UP_GPIO,    "BTN SPEED_UP" },
+        { CONFIG_BTN_SPEED_DOWN_GPIO,  "BTN SPEED_DOWN" },
+        { CONFIG_BTN_MOTOR_START_GPIO,"BTN MOTOR_START" },
+        { CONFIG_BTN_MOTOR_STOP_GPIO,  "BTN MOTOR_STOP" },
+    };
+    const int n = sizeof(pins) / sizeof(pins[0]);
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (pins[i].gpio == pins[j].gpio) {
+                ESP_LOGE(TAG, "配置错误：GPIO %d 被重复使用：\"%s\" 与 \"%s\"。请修改 menuconfig 中引脚配置。",
+                         pins[i].gpio, pins[i].name, pins[j].name);
+                abort();
+            }
+        }
+    }
+}
+
+static void tmc2209_gpio_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << CONFIG_TMC2209_STEP_GPIO) |
+                        (1ULL << CONFIG_TMC2209_DIR_GPIO) |
+                        (1ULL << CONFIG_TMC2209_ENABLE_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 0);
+    gpio_set_level(CONFIG_TMC2209_DIR_GPIO, 0);
+    /* TMC2209 低电平使能 */
+    gpio_set_level(CONFIG_TMC2209_ENABLE_GPIO, 0);
+
+    gpio_config_t btn = {
+        .pin_bit_mask = (1ULL << CONFIG_BTN_SPEED_UP_GPIO) |
+                        (1ULL << CONFIG_BTN_SPEED_DOWN_GPIO) |
+                        (1ULL << CONFIG_BTN_MOTOR_START_GPIO) |
+                        (1ULL << CONFIG_BTN_MOTOR_STOP_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&btn);
+}
+
+static void stepper_task(void *arg)
+{
+    int64_t last_sec_us = esp_timer_get_time();
+    for (;;) {
+        if (!s_motor_running) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        int speed = s_speed_steps_per_sec;
+        if (speed < MOTOR_SPEED_MIN) speed = MOTOR_SPEED_MIN;
+        /* 每步 = 高 + 低，周期 1000/speed ms，半周期 500/speed ms */
+        uint32_t half_ms = 500 / speed;
+        if (half_ms < 1) half_ms = 1;
+
+        gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(half_ms));
+        gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(half_ms));
+
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_sec_us) >= 1000000) {
+            last_sec_us = now_us;
+            s_countdown_sec--;
+            if (s_countdown_sec <= 0) {
+                s_countdown_sec = 0;
+                s_motor_running = 0;
+            }
+        }
+    }
+}
+
+static int button_pressed(int gpio)
+{
+    return gpio_get_level(gpio) == 0; /* 低电平 = 按下 */
+}
+
+static void button_task(void *arg)
+{
+    uint32_t last_up = 0, last_down = 0, last_start = 0, last_stop = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(15));
+        uint32_t t = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (button_pressed(CONFIG_BTN_SPEED_UP_GPIO)) {
+            if (t - last_up > BUTTON_DEBOUNCE_MS) {
+                last_up = t;
+                if (s_speed_steps_per_sec < MOTOR_SPEED_MAX)
+                    s_speed_steps_per_sec += 10;
+            }
+        }
+        if (button_pressed(CONFIG_BTN_SPEED_DOWN_GPIO)) {
+            if (t - last_down > BUTTON_DEBOUNCE_MS) {
+                last_down = t;
+                if (s_speed_steps_per_sec > MOTOR_SPEED_MIN)
+                    s_speed_steps_per_sec -= 10;
+            }
+        }
+        if (button_pressed(CONFIG_BTN_MOTOR_START_GPIO)) {
+            if (t - last_start > BUTTON_DEBOUNCE_MS) {
+                last_start = t;
+                s_motor_running = 1;
+                if (s_countdown_sec <= 0)
+                    s_countdown_sec = COUNTDOWN_DEFAULT_SEC;
+            }
+        }
+        if (button_pressed(CONFIG_BTN_MOTOR_STOP_GPIO)) {
+            if (t - last_stop > BUTTON_DEBOUNCE_MS) {
+                last_stop = t;
+                s_motor_running = 0;
+            }
+        }
+    }
+}
+
+static void display_task(void *arg)
+{
+    char line1[24], line2[24], line3[24];
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_REFRESH_MS));
+        int rpm = s_speed_steps_per_sec * 60 / CONFIG_MOTOR_STEPS_PER_REV;
+        int c = s_countdown_sec;
+        int m = c / 60, s = c % 60;
+        snprintf(line1, sizeof(line1), "RPM: %d", rpm);
+        snprintf(line2, sizeof(line2), "%02d:%02d", m, s);
+        snprintf(line3, sizeof(line3), "%s", s_motor_running ? "RUN " : "STOP");
+        oled_draw_string_line(1, line1);
+        oled_draw_string_line(2, line2);
+        oled_draw_string_line(3, line3);
+    }
+}
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -265,24 +431,38 @@ void app_main(void)
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, false, false, portMAX_DELAY);
 
     uint32_t ip = s_ip_addr.addr;
-    char ip_str[20];
-    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+    snprintf(s_ip_str, sizeof(s_ip_str), "%d.%d.%d.%d",
              (int)(ip >> 0) & 0xff,
              (int)(ip >> 8) & 0xff,
              (int)(ip >> 16) & 0xff,
              (int)(ip >> 24) & 0xff);
-    ESP_LOGI(TAG, "已连接 WiFi，IP: %s", ip_str);
+    ESP_LOGI(TAG, "已连接 WiFi，IP: %s", s_ip_str);
 
     esp_err_t err = oled_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OLED 初始化失败: %s", esp_err_to_name(err));
         return;
     }
-    /* 第一行显示 "IP: x.x.x.x" */
-    char line1[24];
-    snprintf(line1, sizeof(line1), "IP: %s", ip_str);
+
+    check_gpio_duplicates();
+    tmc2209_gpio_init();
+
+    /* OLED 四行：第一行 WiFi IP，第二行转速，第三行倒计时，第四行 RUN/STOP */
     for (uint8_t p = 0; p < OLED_PAGES; p++)
         oled_clear_page(p);
-    oled_draw_string_line0(line1);
-    ESP_LOGI(TAG, "已在 OLED 第一行显示: %s", line1);
+    char line0[24];
+    snprintf(line0, sizeof(line0), "IP: %s", s_ip_str);
+    oled_draw_string_line(0, line0);
+    int rpm0 = s_speed_steps_per_sec * 60 / CONFIG_MOTOR_STEPS_PER_REV;
+    int c0 = s_countdown_sec;
+    snprintf(line0, sizeof(line0), "RPM: %d", rpm0);
+    oled_draw_string_line(1, line0);
+    snprintf(line0, sizeof(line0), "%02d:%02d", c0 / 60, c0 % 60);
+    oled_draw_string_line(2, line0);
+    oled_draw_string_line(3, "STOP");
+
+    xTaskCreate(stepper_task, "stepper", 2048, NULL, 5, NULL);
+    xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
+    xTaskCreate(display_task, "display", 2048, NULL, 4, NULL);
+    ESP_LOGI(TAG, "OLED 四行已显示，电机与按钮任务已启动");
 }
