@@ -75,7 +75,7 @@ config BTN_MOTOR_STOP_GPIO
 
 config MOTOR_STEPS_PER_REV
     int "步进电机每圈步数"
-    default 1600
+    default 200
     help
         1.8° 电机一般为 200 步/圈（整步）。
 endmenu

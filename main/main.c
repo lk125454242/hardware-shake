@@ -18,9 +18,9 @@
 
 static const char *TAG = "main";
 
-/* TMC2209 步进电机：速度与倒计时 */
-#define MOTOR_SPEED_MIN      20   /* 最小步/秒 */
-#define MOTOR_SPEED_MAX      500  /* 最大步/秒 */
+/* TMC2209 步进电机：速度与倒计时，转速 1~300 RPM（步/秒依 MOTOR_STEPS_PER_REV 换算） */
+#define MOTOR_SPEED_MIN      4    /* 最小步/秒 ≈ 1 RPM @200步/圈 */
+#define MOTOR_SPEED_MAX      1000 /* 最大步/秒 = 300 RPM @200步/圈 */
 #define MOTOR_SPEED_DEFAULT  100
 #define COUNTDOWN_DEFAULT_SEC 300 /* 默认 5 分钟 */
 #define BUTTON_DEBOUNCE_MS   80
@@ -334,14 +334,24 @@ static void stepper_task(void *arg)
         }
         int speed = s_speed_steps_per_sec;
         if (speed < MOTOR_SPEED_MIN) speed = MOTOR_SPEED_MIN;
-        /* 每步 = 高 + 低，周期 1000/speed ms，半周期 500/speed ms */
-        uint32_t half_ms = 500 / speed;
-        if (half_ms < 1) half_ms = 1;
+        /* 每步 = 高 + 低，半周期 500000/speed 微秒 */
+        uint32_t half_us = 500000 / (uint32_t)speed;
+        if (half_us < 100) half_us = 100;
 
         gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(half_ms));
+        if (half_us >= 1000) {
+            vTaskDelay(pdMS_TO_TICKS(half_us / 1000));
+        } else {
+            int64_t until = esp_timer_get_time() + half_us;
+            while (esp_timer_get_time() < until) { }
+        }
         gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(half_ms));
+        if (half_us >= 1000) {
+            vTaskDelay(pdMS_TO_TICKS(half_us / 1000));
+        } else {
+            int64_t until = esp_timer_get_time() + half_us;
+            while (esp_timer_get_time() < until) { }
+        }
 
         int64_t now_us = esp_timer_get_time();
         if ((now_us - last_sec_us) >= 1000000) {
