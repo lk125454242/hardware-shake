@@ -42,6 +42,8 @@ static inline int steps_per_sec_to_rpm(int steps_per_sec)
 static volatile int s_motor_running = 0;
 static volatile int s_speed_steps_per_sec = MOTOR_SPEED_DEFAULT;
 static volatile int s_countdown_sec = COUNTDOWN_DEFAULT_SEC;
+static volatile int s_direction = 0;  /* 0=正转，1=反转，默认正转 */
+static volatile uint32_t s_buzz_until_ms = 0;  /* 非 0 表示倒计时结束触发的蜂鸣，在此时间戳前一直响 */
 
 /* 6x8 字体，0-9、A-S、常用符号 */
 static const uint8_t font_6x8[][6] = {
@@ -99,10 +101,12 @@ static const uint8_t font_6x8[][6] = {
     { 0x46, 0x49, 0x49, 0x49, 0x31, 0x00 }, /* S 0x53 */
     { 0x01, 0x01, 0x7F, 0x01, 0x01, 0x00 }, /* T 0x54 */
     { 0x3F, 0x40, 0x40, 0x40, 0x3F, 0x00 }, /* U 0x55 */
+    { 0x07, 0x08, 0x10, 0x20, 0x40, 0x3F }, /* V 0x56 */
+    { 0x7F, 0x40, 0x20, 0x10, 0x20, 0x40 }, /* W 0x57 */
 };
 
 #define FONT_FIRST 0x20
-#define FONT_LAST  0x55
+#define FONT_LAST  0x57
 #define FONT_COLS  6
 
 static esp_err_t oled_write_cmd(uint8_t cmd)
@@ -233,6 +237,9 @@ static void check_gpio_duplicates(void)
         { CONFIG_BTN_SPEED_DOWN_GPIO,  "BTN SPEED_DOWN" },
         { CONFIG_BTN_MOTOR_START_GPIO,"BTN MOTOR_START" },
         { CONFIG_BTN_MOTOR_STOP_GPIO,  "BTN MOTOR_STOP" },
+        { CONFIG_LIMIT_FWD_GPIO,       "LIMIT FWD" },
+        { CONFIG_LIMIT_REV_GPIO,       "LIMIT REV" },
+        { CONFIG_BUZZER_GPIO,          "BUZZER" },
     };
     const int n = sizeof(pins) / sizeof(pins[0]);
     for (int i = 0; i < n; i++) {
@@ -251,7 +258,8 @@ static void tmc2209_gpio_init(void)
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << CONFIG_TMC2209_STEP_GPIO) |
                         (1ULL << CONFIG_TMC2209_DIR_GPIO) |
-                        (1ULL << CONFIG_TMC2209_ENABLE_GPIO),
+                        (1ULL << CONFIG_TMC2209_ENABLE_GPIO) |
+                        (1ULL << CONFIG_BUZZER_GPIO),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -259,15 +267,17 @@ static void tmc2209_gpio_init(void)
     };
     gpio_config(&io);
     gpio_set_level(CONFIG_TMC2209_STEP_GPIO, 0);
-    gpio_set_level(CONFIG_TMC2209_DIR_GPIO, 0);
-    /* TMC2209 低电平使能 */
+    gpio_set_level(CONFIG_TMC2209_DIR_GPIO, 0);  /* 默认正转 */
     gpio_set_level(CONFIG_TMC2209_ENABLE_GPIO, 0);
+    gpio_set_level(CONFIG_BUZZER_GPIO, 0);  /* 有源蜂鸣器默认不响 */
 
     gpio_config_t btn = {
         .pin_bit_mask = (1ULL << CONFIG_BTN_SPEED_UP_GPIO) |
                         (1ULL << CONFIG_BTN_SPEED_DOWN_GPIO) |
                         (1ULL << CONFIG_BTN_MOTOR_START_GPIO) |
-                        (1ULL << CONFIG_BTN_MOTOR_STOP_GPIO),
+                        (1ULL << CONFIG_BTN_MOTOR_STOP_GPIO) |
+                        (1ULL << CONFIG_LIMIT_FWD_GPIO) |
+                        (1ULL << CONFIG_LIMIT_REV_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -293,6 +303,7 @@ static void stepper_task(void *arg)
         }
         int speed = s_speed_steps_per_sec;
         if (speed < MOTOR_SPEED_MIN) speed = MOTOR_SPEED_MIN;
+        gpio_set_level(CONFIG_TMC2209_DIR_GPIO, s_direction);  /* 按限位开关设置的方向 */
         /* 每步 = 高 + 低，半周期 500000/speed 微秒 */
         uint32_t half_us = 500000 / (uint32_t)speed;
         if (half_us < 50) half_us = 50;  /* 支持约 2000 RPM */
@@ -311,6 +322,12 @@ static void stepper_task(void *arg)
             int64_t until = esp_timer_get_time() + half_us;
             while (esp_timer_get_time() < until) { }
         }
+        /* 每约 40 步主动让出 1ms，让 IDLE 运行，避免 task_wdt 触发 */
+        static uint32_t step_count;
+        if (++step_count >= 40) {
+            step_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
 
         int64_t now_us = esp_timer_get_time();
         if ((now_us - last_sec_us) >= 1000000) {
@@ -319,6 +336,8 @@ static void stepper_task(void *arg)
             if (s_countdown_sec <= 0) {
                 s_countdown_sec = 0;
                 s_motor_running = 0;
+                /* 仅倒计时结束停转时触发蜂鸣，手动停止不经过此处 */
+                s_buzz_until_ms = (uint32_t)(now_us / 1000) + 2000;  /* 响约 2 秒 */
             }
         }
         vTaskDelay(0);  /* 让出 CPU，便于 display_task 刷新 OLED 倒计时 */
@@ -333,10 +352,25 @@ static int button_pressed(int gpio)
 static void button_task(void *arg)
 {
     uint32_t last_up = 0, last_down = 0, last_start = 0, last_stop = 0;
+    uint32_t last_limit_fwd = 0, last_limit_rev = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(15));
         uint32_t t = (uint32_t)(esp_timer_get_time() / 1000);
 
+        if (button_pressed(CONFIG_LIMIT_FWD_GPIO)) {
+            if (t - last_limit_fwd > BUTTON_DEBOUNCE_MS) {
+                last_limit_fwd = t;
+                s_direction = 0;
+                gpio_set_level(CONFIG_TMC2209_DIR_GPIO, 0);
+            }
+        }
+        if (button_pressed(CONFIG_LIMIT_REV_GPIO)) {
+            if (t - last_limit_rev > BUTTON_DEBOUNCE_MS) {
+                last_limit_rev = t;
+                s_direction = 1;
+                gpio_set_level(CONFIG_TMC2209_DIR_GPIO, 1);
+            }
+        }
         if (button_pressed(CONFIG_BTN_SPEED_UP_GPIO)) {
             if (t - last_up > BUTTON_DEBOUNCE_MS) {
                 last_up = t;
@@ -369,18 +403,36 @@ static void button_task(void *arg)
 
 static void display_task(void *arg)
 {
-    char line0[24], line1[24], line2[24];
+    char line0[24], line1[24], line2[24], line3[24], line4[24];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_REFRESH_MS));
+        /* 有源蜂鸣器：仅倒计时结束停转时响约 2 秒，手动启停不响 */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        int buzz_on = 0;
+        if (s_buzz_until_ms != 0) {
+            if (now_ms < s_buzz_until_ms) {
+                gpio_set_level(CONFIG_BUZZER_GPIO, 1);
+                buzz_on = 1;
+            } else {
+                gpio_set_level(CONFIG_BUZZER_GPIO, 0);
+                s_buzz_until_ms = 0;
+            }
+        } else {
+            gpio_set_level(CONFIG_BUZZER_GPIO, 0);
+        }
         int rpm = steps_per_sec_to_rpm(s_speed_steps_per_sec);
         int c = s_countdown_sec;
         int m = c / 60, s = c % 60;
         snprintf(line0, sizeof(line0), "STATE %s", s_motor_running ? "RUN" : "STOP");
         snprintf(line1, sizeof(line1), "SPEED %d", rpm);
         snprintf(line2, sizeof(line2), "TIME %02d:%02d", m, s);
+        snprintf(line3, sizeof(line3), "DIR %s", s_direction ? "REV" : "FWD");
+        snprintf(line4, sizeof(line4), "BEEP %s", buzz_on ? "ON " : "OFF");
         oled_draw_string_line(0, line0);
         oled_draw_string_line(1, line1);
         oled_draw_string_line(2, line2);
+        oled_draw_string_line(3, line3);
+        oled_draw_string_line(4, line4);
     }
 }
 
@@ -395,7 +447,7 @@ void app_main(void)
     check_gpio_duplicates();
     tmc2209_gpio_init();
 
-    /* OLED 三行：第 0 页 STATE RUN/STOP，第 1 页 SPEED，第 2 页 TIME（定时器减少时同步刷新） */
+    /* OLED 五行：STATE / SPEED / TIME / DIR / BEEP */
     for (uint8_t p = 0; p < OLED_PAGES; p++)
         oled_clear_page(p);
     char line0[24];
@@ -406,9 +458,11 @@ void app_main(void)
     oled_draw_string_line(1, line0);
     snprintf(line0, sizeof(line0), "TIME %02d:%02d", c0 / 60, c0 % 60);
     oled_draw_string_line(2, line0);
+    oled_draw_string_line(3, "DIR FWD");
+    oled_draw_string_line(4, "BEEP OFF");
 
     xTaskCreate(stepper_task, "stepper", 2048, NULL, 5, NULL);
     xTaskCreate(button_task, "button", 2048, NULL, 6, NULL);
     xTaskCreate(display_task, "display", 2048, NULL, 6, NULL);  /* 与按钮同优先级，高于步进，保证倒计时能刷新到 OLED */
-    ESP_LOGI(TAG, "OLED 已显示 STATE/SPEED/TIME，电机与按钮任务已启动");
+    ESP_LOGI(TAG, "OLED 已显示 STATE/SPEED/TIME/DIR/BEEP，电机与按钮任务已启动");
 }

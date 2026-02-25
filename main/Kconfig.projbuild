@@ -1,5 +1,5 @@
 # put here your custom config value
-# 注意：各 GPIO 不可重复。当前默认占用：OLED 8,9 | 电机 2,3,4 | 按钮 5,6,7,10
+# 注意：各 GPIO 不可重复。当前默认：OLED 8,9 | 电机 2,3,4 | 按钮 5,6,7,10 | 限位 18,19 | 蜂鸣器 20。ESP32-C3 无 GPIO11/12，见 doc/pin.md
 menu "Example Configuration"
 config OLED_I2C_SDA_GPIO
     int "OLED I2C SDA GPIO"
@@ -60,6 +60,24 @@ config BTN_MOTOR_STOP_GPIO
     default 10
     help
         轻触开关，电机停止。勿与其它引脚重复。
+
+config LIMIT_FWD_GPIO
+    int "限位开关-正转 GPIO"
+    default 18
+    help
+        触发后设置电机为正转。低电平有效。ESP32-C3-MINI-1 可用 GPIO: 0,1,2,3,4,5,6,7,8,9,10,18,19,20,21（见 doc/pin.md）。
+
+config LIMIT_REV_GPIO
+    int "限位开关-反转 GPIO"
+    default 19
+    help
+        触发后设置电机为反转。低电平有效。勿与其它引脚重复。
+
+config BUZZER_GPIO
+    int "有源蜂鸣器 GPIO"
+    default 20
+    help
+        有源蜂鸣器，高电平响。仅倒计时结束自动停转时响，手动启停不响。勿与其它引脚重复。
 
 config MOTOR_STEPS_PER_REV
     int "电机每圈脉冲数（与驱动细分一致）"
