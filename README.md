@@ -7,13 +7,10 @@ Please check [ESP-IDF docs](https://docs.espressif.com/projects/esp-idf/en/lates
 
 ### 环境配置
 ```
-ipf.py menuconfig
-# 设置为 4mb memory
+idf.py set-target esp32c3
 ```
-
-```
-ipf.py set-target esp32c3
-```
+- **Flash 大小**：工程已用 `sdkconfig.defaults` 设为 4MB，无需在 menuconfig 里再设，可避免 “Detected size(4096k) larger than the size in the binary image header(2048k)” 告警。
+- **I2C**：已使用新驱动 `driver/i2c_master.h`，不再出现 “please migrate to driver/i2c_master.h” 提示。
 
 ### 编译并写入
 **管理员身份运行 esp power shell**
@@ -21,6 +18,8 @@ ipf.py set-target esp32c3
 cd j:\ESP32\shake
 idf.py build
 idf.py -p COM4 flash monitor
+
+idf.py -p COM4 monitor
 ```
 
 ### 若出现 `ninja: fatal: CreateProcess: Access is denied`

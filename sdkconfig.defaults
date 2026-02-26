@@ -1,0 +1,2 @@
+# 与板载 Flash 一致，避免告警：Detected size(4096k) larger than the size in the binary image header(2048k)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
