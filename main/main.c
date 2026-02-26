@@ -13,9 +13,9 @@
 static const char *TAG = "main";
 
 /* 电机由 I2C 从机驱动；转速为模拟值 1~100，不计算脉冲，具体 RPM 由从机处理 */
-#define SPEED_MIN   1
-#define SPEED_MAX   100
-#define SPEED_DEFAULT 50
+#define SPEED_MIN   50
+#define SPEED_MAX   80
+#define SPEED_DEFAULT 90
 #define COUNTDOWN_DEFAULT_SEC 300
 #define BUTTON_DEBOUNCE_MS   80
 #define DISPLAY_REFRESH_MS   100
