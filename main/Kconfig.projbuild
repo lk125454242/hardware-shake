@@ -27,25 +27,25 @@ config MOTOR_SLAVE_I2C_ADDR
 
 config BTN_SPEED_UP_GPIO
     int "按钮 增加转速 GPIO"
-    default 5
+    default 4
     help
         轻触开关，转速+1（1~100）。勿与其它引脚重复。
 
 config BTN_SPEED_DOWN_GPIO
     int "按钮 减少转速 GPIO"
-    default 6
+    default 5
     help
         轻触开关，转速-1（1~100）。勿与其它引脚重复。
 
 config BTN_MOTOR_START_GPIO
     int "按钮3 电机启动 GPIO"
-    default 7
+    default 6
     help
         轻触开关，电机启动。勿与其它引脚重复。
 
 config BTN_MOTOR_STOP_GPIO
     int "按钮 电机停止 GPIO"
-    default 10
+    default 7
     help
         轻触开关，电机停止。勿与其它引脚重复。
 
